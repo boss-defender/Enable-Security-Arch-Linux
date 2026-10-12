@@ -15,7 +15,7 @@
 
 > 📅 **Last updated: 12 October 2026** (v3.0.3)
 >
-> Arch and Arch-based distros change fast: boot loaders, packages and defaults move over time. If this date is more than about 6 months old, check the [commits](../../commits) and [issues](../../issues) before running, and test on a VM or snapshot first.
+> Arch and Arch-based distros change fast: boot loaders, packages and defaults move over time. If this date is more than about 6 months old, check the [commits](https://github.com/boss-defender/Enable-Security-Arch-Linux/commits/main) and [issues](https://github.com/boss-defender/Enable-Security-Arch-Linux/issues) before running, and test on a VM or snapshot first.
 
 ---
 
@@ -43,8 +43,8 @@ Run it once and your system gets a solid security baseline that survives every r
 ## 🚀 Quick start
 
 ```bash
-git clone https://github.com/<your-username>/<your-repo>.git
-cd <your-repo>
+git clone https://github.com/boss-defender/Enable-Security-Arch-Linux.git
+cd Enable-Security-Arch-Linux
 chmod +x enable-security-for-arch-linux.sh
 
 ./enable-security-for-arch-linux.sh --dry-run   # preview, changes nothing
