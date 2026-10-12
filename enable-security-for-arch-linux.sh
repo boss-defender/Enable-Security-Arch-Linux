@@ -1,12 +1,27 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  enable-security-for-arch-linux.sh  —  FINAL v3.0.3
+#  enable-security-for-arch-linux.sh  —  v3.2.0
 # =============================================================================
 #  A production-grade security baseline for Arch-based systems.
 #  Supported: Arch Linux, Manjaro, Omarchy, EndeavourOS, Garuda Linux.
 #
 #  CachyOS IS NOT SUPPORTED. Do not run this script on CachyOS.
 #  Artix Linux is NOT SUPPORTED (no systemd).
+#
+#  v3.2.0 changes:
+#    - NEW: apparmor.d is built from the AUR automatically (as the normal
+#      user who ran the script, installed with pacman -U; no AUR helper).
+#      Upstream key is checked; go/just are removed after the build.
+#      parser.conf gets the cache settings upstream asks for. --no-aur skips it.
+#    - NEW: Ctrl+C and Ctrl+Z stop the script safely: the running step
+#      finishes first (the AUR build is cancelled at once), then undo is offered.
+#    - CHANGE: the AI-agent switch is shown and works the same on every
+#      supported system, not only Omarchy.
+#    - NEW: if the setup fails (or the script crashes), everything is undone
+#      automatically and the user is told: "Sorry, I failed - but your system
+#      is safe". Original files come back; installed packages are removed.
+#    - FIX: question prompts were invisible ("exec 9>lock 2>/dev/null"
+#      silenced stderr for the whole script).
 #
 #  v3.0.3 changes:
 #    - FIX: patch_quoted_var writes the original operator back (+= stays +=).
@@ -69,7 +84,7 @@ umask 022
 # =============================================================================
 # SECTION 1: SETTINGS AND FILE LOCATIONS
 # =============================================================================
-SCRIPT_VERSION="3.0.3"
+SCRIPT_VERSION="3.2.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || true)"
 SCRIPT_FILE="${SCRIPT_PATH##*/}"
 [[ -n $SCRIPT_FILE ]] || SCRIPT_FILE="enable-security-for-arch-linux.sh"
@@ -133,6 +148,7 @@ AI_MODE=""
 ASSUME_YES=0
 DRY_RUN=0
 FORCE_UFW=0
+NO_AUR=0
 OPT_NO_COLOR=0
 SHOW_HELP=0
 SHOW_VERSION=0
@@ -142,6 +158,12 @@ STEP_N=0
 STEP_TOTAL=1
 STEP_FAILS=0
 CURRENT_PID=""
+STOP_REQUESTED=0     # set by Ctrl+C / Ctrl+Z; acted on between steps
+IN_SAFE_STOP=0
+STEP_KILLABLE=0      # 1 = the running step may be cancelled at once (AUR build)
+WATCH_PID=""
+ENABLE_RUNNING=0     # 1 while --enable is changing the system (for auto-undo)
+AUTO_UNDO_DONE=0
 RUN_TMP=""
 DISTRO_KEY=""
 DISTRO_LABEL=""
@@ -276,7 +298,11 @@ spin_until_done() {
   local pid=$1 desc=$2 i=0
   (( UI_TTY )) || return 0
   while kill -0 "$pid" 2>/dev/null; do
-    step_live "${SPIN_FRAMES[i % ${#SPIN_FRAMES[@]}]}" "$desc"
+    if (( STOP_REQUESTED )); then
+      step_live "${SPIN_FRAMES[i % ${#SPIN_FRAMES[@]}]}" "$desc  (stopping after this step...)"
+    else
+      step_live "${SPIN_FRAMES[i % ${#SPIN_FRAMES[@]}]}" "$desc"
+    fi
     i=$(( i + 1 ))
     sleep 0.1
   done
@@ -345,10 +371,18 @@ run_step() {
   fi
   mark=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
   log ">>> STEP $STEP_N: $desc"
-  "$@" </dev/null >>"$LOG_FILE" 2>&1 &
+  # The step ignores Ctrl+C / Ctrl+Z itself (the script decides when to stop),
+  # so a package install or boot-menu update is never cut off halfway.
+  { trap '' INT QUIT TSTP TTIN TTOU; "$@"; } </dev/null >>"$LOG_FILE" 2>&1 &
   CURRENT_PID=$!
   spin_until_done "$CURRENT_PID" "$desc"
-  wait "$CURRENT_PID"; rc=$?
+  # 'wait' returns early when Ctrl+C / Ctrl+Z arrives; keep waiting until the
+  # step has really finished, so nothing is ever left half-done.
+  while :; do
+    wait "$CURRENT_PID"; rc=$?
+    if (( rc > 128 )) && kill -0 "$CURRENT_PID" 2>/dev/null; then continue; fi
+    break
+  done
   CURRENT_PID=""
   log "<<< exit code $rc"
   if (( rc == 0 )); then
@@ -358,6 +392,7 @@ run_step() {
     step_final fail "$desc" "failed"
     show_log_tail "$mark"
   fi
+  (( STOP_REQUESTED && ! IN_SAFE_STOP )) && safe_stop
   return "$rc"
 }
 
@@ -378,22 +413,83 @@ skip_step() {
 }
 
 cleanup() {
+  local rc=$?
+  # The script ended unexpectedly in the middle of --enable (an error, a crash,
+  # or a "die" message): undo everything so the system is never left half-done.
+  if (( ENABLE_RUNNING && ! IN_SAFE_STOP && ! DRY_RUN && rc != 0 )); then
+    trap '' INT TERM USR1
+    auto_rollback "the script stopped unexpectedly (exit code $rc)."
+  fi
   cursor_show
+  [[ -n ${WATCH_PID:-} ]] && kill "$WATCH_PID" 2>/dev/null
   if [[ -n ${RUN_TMP:-} && -d $RUN_TMP ]]; then rm -rf "$RUN_TMP"; fi
 }
 
+# --- Safe stop with Ctrl+C or Ctrl+Z ------------------------------------------
+# Ctrl+Z normally freezes a program in the middle of what it is doing. Freezing
+# pacman or a boot-loader update would leave the package database locked or the
+# boot menu half-written, so this script turns Ctrl+Z into a SAFE STOP instead:
+#   * The script and every program it starts ignore the freeze signal (TSTP).
+#   * A tiny watcher process still notices Ctrl+Z and tells the script (USR1).
+#   * The running step is allowed to finish; then the script stops and offers
+#     to undo its changes. The AUR build is the only step cancelled at once,
+#     because cancelling a compile is harmless.
+start_stop_watcher() {
+  local parent=$$
+  (
+    exec 9>&-          # never hold the "already running" lock
+    trap 'kill -USR1 "$parent" 2>/dev/null' TSTP
+    trap 'exit 0' TERM
+    while kill -0 "$parent" 2>/dev/null; do
+      ( trap '' TSTP; exec sleep 1 ) &
+      wait $! 2>/dev/null
+    done
+  ) </dev/null >/dev/null 2>&1 &
+  WATCH_PID=$!
+  trap '' TSTP TTIN TTOU
+}
+
+kill_tree() {
+  local pid=$1 c
+  for c in $(pgrep -P "$pid" 2>/dev/null); do kill_tree "$c"; done
+  kill -TERM "$pid" 2>/dev/null || true
+}
+
 on_interrupt() {
-  trap - INT TERM
-  cursor_show
-  if [[ -n $CURRENT_PID ]]; then
-    pkill -TERM -P "$CURRENT_PID" 2>/dev/null || true
-    kill -TERM "$CURRENT_PID" 2>/dev/null || true
-    wait "$CURRENT_PID" 2>/dev/null || true
+  if (( IN_SAFE_STOP )); then
+    printf '\n'; warn "Please wait - I am putting things back safely."
+    return 0
   fi
+  if [[ -n $CURRENT_PID ]] && kill -0 "$CURRENT_PID" 2>/dev/null; then
+    if (( STEP_KILLABLE )) && ! mark_has no_kill; then
+      STOP_REQUESTED=1
+      kill_tree "$CURRENT_PID"
+      return 0
+    fi
+    if (( ! STOP_REQUESTED )); then
+      STOP_REQUESTED=1
+      printf '\n'
+      warn "Stop requested. Finishing the current step first so nothing is left half-done..."
+    fi
+    return 0
+  fi
+  safe_stop
+}
+
+safe_stop() {
+  IN_SAFE_STOP=1
+  STOP_REQUESTED=0
+  cursor_show
   printf '\n'
-  warn "Stopped before the script finished."
+  warn "Stopped safely before the script finished."
+  aur_leftover_cleanup
   if [[ -t 0 ]] && manifest_nonempty && (( ! DRY_RUN )); then
     offer_rollback Y "You stopped the script while it was changing files."
+  elif [[ -s ${STATE_FILE:-/nonexistent} ]] && (( ! DRY_RUN )); then
+    info "Nothing is left half-done, but the steps that finished are active (for example the firewall)."
+    info "To continue, run the script again. To undo everything:  ./${SCRIPT_FILE} --uninstall"
+  else
+    info "Nothing was changed. Run the script again any time."
   fi
   exit 130
 }
@@ -543,6 +639,7 @@ parse_args() {
       -y|--yes)             ASSUME_YES=1 ;;
       --dry-run)            DRY_RUN=1 ;;
       --force-ufw)          FORCE_UFW=1 ;;
+      --no-aur)             NO_AUR=1 ;;
       --no-color)           OPT_NO_COLOR=1 ;;
       -h|--help)            SHOW_HELP=1 ;;
       -V|--version)         SHOW_VERSION=1 ;;
@@ -576,7 +673,7 @@ ${C_BOLD}MAIN COMMANDS${C_RESET}  (choose one; no option = install and enable)
   --rollback           Undo only my file edits and switch off what I enabled.
   --status             Show what is installed and active right now.
 
-${C_BOLD}AI-AGENT SWITCH${C_RESET}  (for Omarchy and other systems with AI agents)
+${C_BOLD}AI-AGENT SWITCH${C_RESET}  (works on Arch, Manjaro, Omarchy, EndeavourOS and Garuda)
   --allow-ai-agent     AppArmor profiles go from "enforce" to "complain" (log only).
                        NOTE: This only affects programs that HAVE a profile.
                        Unprofiled programs are not confined either way.
@@ -588,6 +685,7 @@ ${C_BOLD}EXTRA OPTIONS${C_RESET}
   -y, --yes            Do not ask questions.
   --dry-run            Show what would happen; change nothing.
   --force-ufw          Replace firewalld by ufw (firewalld config is backed up).
+  --no-aur             Do not build the apparmor.d profiles from the AUR.
   --no-color           Plain text, no colours.
   -h, --help           Show this help.
   -V, --version        Show the version.
@@ -627,7 +725,9 @@ init_workdirs() {
   if ! { : >>"$LOG_FILE"; } 2>/dev/null; then LOG_FILE="/tmp/arch-security-$(id -u).log"; : >>"$LOG_FILE"; fi
   log "================ $SCRIPT_FILE v$SCRIPT_VERSION  action=$ACTION dry_run=$DRY_RUN ================"
   if (( ! DRY_RUN )); then
-    exec 9>"$LOCK_FILE" 2>/dev/null || return 0
+    # The braces matter: "exec 9>file 2>/dev/null" would silence stderr for the
+    # whole script, hiding every question prompt (read -p writes to stderr).
+    { exec 9>"$LOCK_FILE"; } 2>/dev/null || return 0
     flock -n 9 || die_box "Already running" "Another copy of this script is running. Wait for it to finish."
   fi
 }
@@ -695,9 +795,12 @@ preflight() {
     info "AppArmor       : supported by this kernel"
   fi
 
-  if is_omarchy; then
-    info "Omarchy found  : AI agents are ${AI_MODE:-allowed (default)}."
-  fi
+  local ai_now
+  ai_now=${AI_MODE:-$(state_get AI_AGENT 2>/dev/null || true)}
+  case $ai_now in
+    blocked) info "AI agents      : blocked (AppArmor enforce mode)" ;;
+    *)       info "AI agents      : allowed (AppArmor complain mode, default)" ;;
+  esac
 }
 
 # =============================================================================
@@ -1520,7 +1623,25 @@ undo_files() {
     done
   done
   if (( boot_touched && ! boot_left )); then
-    bootloader_regen || echo "Note: the boot menu could not be refreshed automatically; please run your boot loader update command."
+    # Keep the restored boot menu files: if the refresh fails, put them back,
+    # so a broken boot-loader tool can never leave the boot menu worse off.
+    local keep="" gp gi=0
+    if [[ -n ${RUN_TMP:-} && -d $RUN_TMP ]]; then
+      keep="$RUN_TMP/bootkeep"; mkdir -p "$keep"
+      for line in "${lines[@]}"; do
+        IFS='|' read -r kind gp _ _ <<<"$line"
+        [[ $kind == generated && -f $gp ]] || continue
+        gi=$(( gi + 1 )); cp -p -- "$gp" "$keep/$gi" && printf '%s\n' "$gp" >>"$keep/list"
+      done
+    fi
+    if ! bootloader_regen; then
+      echo "Note: the boot menu could not be refreshed; keeping the restored boot menu files."
+      if [[ -n $keep && -f $keep/list ]]; then
+        gi=0
+        while IFS= read -r gp; do gi=$(( gi + 1 )); cp -p -- "$keep/$gi" "$gp"; done <"$keep/list"
+      fi
+    fi
+    [[ -n $keep ]] && rm -rf -- "$keep"
   fi
   IN_ROLLBACK=0
   # Clean up any remaining backups for generated files
@@ -1537,6 +1658,89 @@ rollback_changes() {
   undo_files "$mode" || return 1
   state_del KERNEL_PARAM_ADDED; state_del KERNEL_PARAM_MODE; state_del KERNEL_PARAM_BOOTLOADER
   return 0
+}
+
+# --- Automatic undo after a failed setup ---------------------------------------
+# Puts the system back to how it was before this script: switches off what it
+# turned on, restores every original file from its .backup copy (and deletes
+# files it created), and removes the packages it installed. Runs without
+# questions. Prints one problem per line for anything it could not undo.
+state_add_list() {
+  local cur
+  cur=$(state_get "$1" 2>/dev/null || true)
+  [[ " $cur " == *" $2 "* ]] && return 0
+  state_set "$1" "${cur:+$cur }$2"
+}
+
+# base-devel / git that this script installed only to build apparmor.d.
+remove_build_tools() {
+  local t keep=()
+  for t in $(state_get INSTALLED_BUILD_TOOLS 2>/dev/null || true); do
+    pkg_installed "$t" && keep+=("$t")
+  done
+  (( ${#keep[@]} )) || return 0
+  pacman_lock_wait || return 1
+  pacman -Rns --noconfirm "${keep[@]}" || pacman -R --noconfirm "${keep[@]}" || return 1
+  state_del INSTALLED_BUILD_TOOLS
+}
+
+undo_everything() {
+  local errs=0 inst
+  fw_undo || { echo "UNDO-PROBLEM: the firewall could not be switched back."; errs=$(( errs + 1 )); }
+  aa_undo || { echo "UNDO-PROBLEM: AppArmor could not be switched back."; errs=$(( errs + 1 )); }
+  if [[ -n $(state_get KERNEL_PARAM_BOOTLOADER 2>/dev/null) ]]; then BOOTLOADER=$(state_get KERNEL_PARAM_BOOTLOADER); fi
+  undo_files force || { echo "UNDO-PROBLEM: some files could not be restored (look for *.backup)."; errs=$(( errs + 1 )); }
+  inst=$(state_get INSTALLED_APPARMOR_D 2>/dev/null || echo 0)
+  if [[ $inst == 1 ]] && pkg_installed apparmor.d; then
+    pkg_remove apparmor.d || { echo "UNDO-PROBLEM: the apparmor.d package could not be removed."; errs=$(( errs + 1 )); }
+  fi
+  if [[ $(state_get CREATED_EARLYPOLICY 2>/dev/null) == 1 ]]; then rm -rf -- /etc/apparmor/earlypolicy; fi
+  remove_build_tools || echo "NOTE: base-devel/git (installed for the AUR build) were left installed."
+  inst=$(state_get INSTALLED_UFW 2>/dev/null || echo 0)
+  if [[ $inst == 1 ]] && pkg_installed ufw; then
+    pkg_remove ufw || { echo "UNDO-PROBLEM: the ufw package could not be removed."; errs=$(( errs + 1 )); }
+  fi
+  inst=$(state_get INSTALLED_APPARMOR 2>/dev/null || echo 0)
+  if [[ $inst == 1 ]] && pkg_installed apparmor; then
+    pkg_remove apparmor || { echo "UNDO-PROBLEM: the AppArmor package could not be removed."; errs=$(( errs + 1 )); }
+  fi
+  if (( errs == 0 )); then cleanup_state; fi
+  return "$errs"
+}
+
+auto_rollback() {
+  local why=$1 ok=1 mark
+  (( AUTO_UNDO_DONE || DRY_RUN )) && return 0
+  AUTO_UNDO_DONE=1
+  ENABLE_RUNNING=0
+  IN_SAFE_STOP=1          # Ctrl+C / Ctrl+Z now only asks to wait
+  aur_leftover_cleanup
+  log "AUTO-ROLLBACK: $why"
+  mark=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
+  STEP_N=0; STEP_TOTAL=1
+  section "Something failed - putting your system back automatically"
+  run_step "Undoing every change I made (original files back, my packages removed)" undo_everything || ok=0
+  printf '\n'
+  if (( ok )); then
+    box_top "$C_YELLOW"
+    box_row "$C_YELLOW" "${C_BOLD}${C_YELLOW}${SYM_WARN}  Sorry, I failed - but your system is safe${C_RESET}"
+    box_sep "$C_YELLOW"
+    box_text "$C_YELLOW" "" "What went wrong: ${why^}"
+    box_text "$C_YELLOW" "" "I undid everything automatically: my edited files are gone, your original files are back, and the packages I installed were removed. Your system is exactly as it was before you ran this script."
+    box_text "$C_YELLOW" "$C_DIM" "Full details: ${LOG_FILE}"
+    box_text "$C_YELLOW" "$C_DIM" "Fix the problem above, then run the script again."
+    box_bot "$C_YELLOW"
+  else
+    box_top "$C_RED"
+    box_row "$C_RED" "${C_BOLD}${C_RED}${SYM_FAIL}  Sorry, I failed - and I could not undo everything${C_RESET}"
+    box_sep "$C_RED"
+    box_text "$C_RED" "" "What went wrong: ${why^}"
+    while IFS= read -r l; do box_text "$C_RED" "" "${l#UNDO-PROBLEM: }"; done < <(tail -c +"$(( mark + 1 ))" "$LOG_FILE" | grep '^UNDO-PROBLEM:' || true)
+    box_text "$C_RED" "" "Every original file still has a copy named <file>.backup next to it. Try:  ./${SCRIPT_FILE} --uninstall"
+    box_text "$C_RED" "$C_DIM" "Full details: ${LOG_FILE}"
+    box_bot "$C_RED"
+  fi
+  printf '\n'
 }
 
 offer_rollback() {
@@ -1595,9 +1799,7 @@ show_enable_plan() {
   fi
   if (( AA_KERNEL_SUPPORTED )); then
     info "AppArmor: install it and switch it on at boot (one reboot needed)."
-    if [[ $DISTRO_KEY == omarchy ]]; then
-      info "Omarchy detected: profiles will start in 'complain' (log-only) mode for safety."
-    fi
+    info "AI-agent switch: works on every supported system (--allow-ai-agent / --disable-ai-agent)."
   else
     warn "AppArmor: SKIPPED — this kernel was built without AppArmor."
     warn "Firewall and kernel hardening will still be applied."
@@ -1616,21 +1818,26 @@ show_enable_plan() {
     info "apparmor.d is installed; it ships with all profiles in COMPLAIN mode by default."
     info "This means AppArmor will only log violations, not block them, until you enforce manually."
   else
-    info "On pure Arch, only the stock AppArmor profiles are installed."
-    info "For full coverage, install apparmor.d-git from the AUR after setup."
+    if (( NO_AUR )) || [[ -z $(aur_build_user) ]]; then
+      info "For full coverage, install apparmor.d from the AUR after setup."
+    else
+      info "apparmor.d (over 1500 profiles) will be built from the AUR as your normal user (a few minutes)."
+    fi
   fi
   info "Backups: before editing a file I save a copy next to it, named <file>.backup."
   info "Everything is permanent and survives a reboot."
+  info "Press Ctrl+C or Ctrl+Z at any time to stop safely: I finish the current step first, then offer to undo."
 }
 
 do_enable() {
-  STEP_TOTAL=10
+  STEP_TOTAL=12
   local fw_ok=1 aa_ok=1 kp_ok=1 sys_ok=1 prev
 
   decide_firewall
   resolve_ai_mode
   show_enable_plan
   ask_yes_no "Continue?" Y || { info "Okay, nothing was changed."; exit 0; }
+  (( DRY_RUN )) || ENABLE_RUNNING=1
   ask_upgrade_policy
   section "Setting up your security system"
 
@@ -1667,6 +1874,7 @@ do_enable() {
   if (( ! AA_KERNEL_SUPPORTED )) || ! aa_supported; then
     skip_step "Installing AppArmor" "this kernel has no AppArmor (compiled out)"
     skip_step "Installing AppArmor profiles (apparmor.d)" "this kernel has no AppArmor"
+    skip_step "Tuning AppArmor for apparmor.d" "this kernel has no AppArmor"
     skip_step "Enabling AppArmor in the boot settings" "this kernel has no AppArmor"
     skip_step "Turning AppArmor on, also after every reboot" "this kernel has no AppArmor"
     AA_STATUS=unsupported
@@ -1682,16 +1890,31 @@ do_enable() {
         state_set INSTALLED_APPARMOR_D 1
         run_step "Installing AppArmor profiles (apparmor.d)" pkg_install apparmor.d || add_note "apparmor.d could not be installed; AppArmor will have very few profiles."
       else
-        AUR_HELPER=$(detect_aur_helper)
-        skip_step "Installing AppArmor profiles (apparmor.d)" "not in official repo"
-        if [[ -n $AUR_HELPER ]]; then
-          add_note "For full AppArmor protection, install 'apparmor.d-git' from the AUR:  ${AUR_HELPER} -S apparmor.d-git  (then reboot)."
+        local bu
+        bu=$(aur_build_user)
+        if (( NO_AUR )); then
+          skip_step "Installing AppArmor profiles (apparmor.d)" "--no-aur given"
+          add_note "For full AppArmor protection, install 'apparmor.d' from the AUR (yay -S apparmor.d), then reboot."
+        elif [[ -z $bu ]]; then
+          skip_step "Installing AppArmor profiles (apparmor.d)" "no normal user to build it as"
+          add_note "apparmor.d is built from the AUR as a normal user. Run this script as your normal user (it asks for sudo itself) to install it automatically."
         else
-          add_note "For full AppArmor protection, install 'apparmor.d-git' from the AUR. First install an AUR helper like 'yay' or 'paru'."
+          state_set INSTALLED_APPARMOR_D 1
+          STEP_KILLABLE=1
+          run_step "Building and installing AppArmor profiles (apparmor.d, from the AUR, a few minutes)" aur_install_apparmor_d "$bu" \
+            || { state_set INSTALLED_APPARMOR_D 0; add_note "apparmor.d could not be built from the AUR; details are in $LOG_FILE. AppArmor still works with the stock profiles."; }
+          STEP_KILLABLE=0; mark_clear no_kill
         fi
+      fi
+      if pkg_installed apparmor.d || { (( DRY_RUN )) && (( ! NO_AUR )); }; then
+        run_step "Tuning AppArmor for apparmor.d (fast profile cache, backup first)" aa_parser_conf_tune \
+          || add_note "Could not tune $APPARMOR_PARSER_CONF; boot may be a little slower with apparmor.d."
+      else
+        skip_step "Tuning AppArmor for apparmor.d" "apparmor.d is not installed"
       fi
     else
       skip_step "Installing AppArmor profiles (apparmor.d)" "the AppArmor package is missing"
+      skip_step "Tuning AppArmor for apparmor.d" "the AppArmor package is missing"
     fi
 
     if (( ! aa_ok )); then
@@ -1751,6 +1974,116 @@ do_enable() {
 
   state_set ENABLED 1
   finish_enable
+}
+
+# --- apparmor.d from the AUR -------------------------------------------------
+# makepkg refuses to run as root, so the package is built as the normal user
+# who started the script (SUDO_USER) and then installed by root with pacman -U.
+# No AUR helper and no extra password prompt are needed.
+APPARMOR_D_AUR_URL="https://aur.archlinux.org/apparmor.d.git"
+APPARMOR_D_PGP_KEY="06A26D531D56C42D66805049C5469996F0DF68EC"   # Alexandre Pujol (upstream)
+
+aur_build_user() {
+  local u=${SUDO_USER:-}
+  [[ -n $u && $u != root ]] || return 0
+  [[ $(id -u "$u" 2>/dev/null) =~ ^[0-9]+$ ]] || return 0
+  (( $(id -u "$u") != 0 )) || return 0
+  printf '%s' "$u"
+}
+
+aur_install_apparmor_d() {
+  local u=$1 home dir d rc=0 key=$APPARMOR_D_PGP_KEY pgp_opt=() pkgs=() f
+  local -a need=() temp=()
+  home=$(getent passwd "$u" | cut -d: -f6)
+  [[ -n $home && -d $home ]] || { echo "PROBLEM: the home folder of '$u' was not found."; return 1; }
+  as_user() { runuser -u "$u" -- env HOME="$home" LC_ALL=C "$@"; }
+
+  # Build tools. go and just are only needed for the build and are removed
+  # again afterwards if this script installed them.
+  for d in base-devel git go just; do pkg_installed "$d" || need+=("$d"); done
+  for d in go just; do pkg_installed "$d" || temp+=("$d"); done
+  if (( ${#need[@]} )); then
+    pkg_install "${need[@]}" || return 1
+    for d in "${need[@]}"; do [[ $d == go || $d == just ]] || state_add_list INSTALLED_BUILD_TOOLS "$d"; done
+  fi
+
+  dir=$(as_user mktemp -d "${TMPDIR:-/tmp}/asec-aur.XXXXXX") || return 1
+  # Remember what to clean up if the build is cancelled with Ctrl+C / Ctrl+Z.
+  [[ -n ${RUN_TMP:-} ]] && { printf '%s\n' "$dir" >"$RUN_TMP/aur_dir"; printf '%s\n' "${temp[@]}" >"$RUN_TMP/aur_temp"; }
+  echo ">> building apparmor.d as user '$u' in $dir"
+  as_user git clone --depth 1 "$APPARMOR_D_AUR_URL" "$dir/src" || rc=1
+
+  if (( rc == 0 )); then
+    # The release tarball is signed by upstream. Fetch the key for the build
+    # user; if no key server answers, the sha512 sums pinned in the PKGBUILD
+    # still protect the download.
+    if ! as_user gpg --batch --list-keys "$key" >/dev/null 2>&1; then
+      as_user gpg --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys "$key" \
+        || as_user gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys "$key" \
+        || { echo "NOTE: could not fetch the upstream signing key; relying on the pinned sha512 sums."; pgp_opt=(--skippgpcheck); }
+    fi
+    ( cd "$dir/src" && as_user makepkg --noconfirm --cleanbuild "${pgp_opt[@]}" ) || { echo "PROBLEM: makepkg failed while building apparmor.d."; rc=1; }
+  fi
+
+  if (( rc == 0 )); then
+    for f in "$dir"/src/*.pkg.tar.*; do
+      [[ $f == *.sig || $f == *-debug-* ]] && continue
+      [[ -f $f ]] && pkgs+=("$f")
+    done
+    (( ${#pkgs[@]} )) || { echo "PROBLEM: makepkg produced no package."; rc=1; }
+  fi
+  if (( rc == 0 )); then
+    mark_set no_kill      # from here on, Ctrl+C / Ctrl+Z waits for pacman
+    pacman_lock_wait || rc=1
+    (( rc == 0 )) && { pacman -U --noconfirm --needed "${pkgs[@]}" || rc=1; }
+    # Mark the helper packages as dependencies so 'pacman -Rns apparmor.d'
+    # (used by --uninstall) removes them too.
+    (( rc == 0 )) && pacman -D --asdeps apparmor.d-base apparmor.d-tools >/dev/null 2>&1
+  fi
+
+  if (( ${#temp[@]} )); then
+    pacman_lock_wait && pacman -Rns --noconfirm "${temp[@]}" >/dev/null 2>&1 \
+      && echo "Removed the build-only tools again: ${temp[*]}"
+  fi
+  rm -rf -- "$dir"
+  rm -f -- "$RUN_TMP/aur_dir" "$RUN_TMP/aur_temp" 2>/dev/null
+  return "$rc"
+}
+
+# Clean up after a cancelled AUR build: its temp folder and build-only tools.
+aur_leftover_cleanup() {
+  local d p
+  local -a temp=()
+  [[ -n ${RUN_TMP:-} && -f $RUN_TMP/aur_dir ]] || return 0
+  d=$(<"$RUN_TMP/aur_dir")
+  [[ $d == */asec-aur.* && -d $d ]] && rm -rf -- "$d"
+  if [[ -f $RUN_TMP/aur_temp ]]; then
+    while IFS= read -r p; do [[ -n $p ]] && pkg_installed "$p" && temp+=("$p"); done <"$RUN_TMP/aur_temp"
+  fi
+  if (( ${#temp[@]} )); then
+    pacman_lock_wait >>"$LOG_FILE" 2>&1 && pacman -Rns --noconfirm "${temp[@]}" >>"$LOG_FILE" 2>&1
+  fi
+  rm -f -- "$RUN_TMP/aur_dir" "$RUN_TMP/aur_temp"
+}
+
+# apparmor.d ships ~100k lines of rules; upstream asks for a compressed,
+# early-loaded policy cache in parser.conf.
+aa_parser_conf_tune() {
+  local f=$APPARMOR_PARSER_CONF line changed=0
+  local -a want=("write-cache" "cache-loc /etc/apparmor/earlypolicy/" "Optimize=compress-fast")
+  [[ -f $f ]] || { echo "$f not found - skipping."; return 0; }
+  for line in "${want[@]}"; do
+    grep -qxF -- "$line" "$f" || { changed=1; break; }
+  done
+  (( changed )) || { echo "$f is already tuned."; return 0; }
+  track_file "$f" || return 1
+  for line in "${want[@]}"; do
+    grep -qxF -- "$line" "$f" || printf '%s\n' "$line" >>"$f"
+  done
+  if [[ ! -d /etc/apparmor/earlypolicy ]]; then
+    mkdir -p /etc/apparmor/earlypolicy && state_set CREATED_EARLYPOLICY 1
+  fi
+  echo "Tuned $f for apparmor.d."
 }
 
 detect_aur_helper() {
@@ -1816,6 +2149,13 @@ do_uninstall() {
     run_step "Removing the apparmor.d package I installed" pkg_remove apparmor.d
   else
     skip_step "Removing the apparmor.d package" "it was on your system before, or not installed"
+  fi
+  if [[ $(state_get CREATED_EARLYPOLICY 2>/dev/null) == 1 ]] && (( ! DRY_RUN )); then
+    rm -rf -- /etc/apparmor/earlypolicy && state_del CREATED_EARLYPOLICY
+  fi
+  if [[ -n $(state_get INSTALLED_BUILD_TOOLS 2>/dev/null) ]]; then
+    run_step "Removing the build tools I installed for apparmor.d" remove_build_tools \
+      || add_note "base-devel/git could not be removed; remove them by hand if you do not need them."
   fi
 
   inst=$(state_get INSTALLED_UFW 2>/dev/null || echo 0)
@@ -1959,7 +2299,19 @@ EOF
 }
 
 finish_enable() {
-  local verdict=ok bc n
+  local verdict=ok bc n why=""
+  ENABLE_RUNNING=0
+  if (( ! DRY_RUN )); then
+    [[ $FW_STATUS == fail ]]  && why+="The firewall could not be set up. "
+    [[ $AA_STATUS == fail ]]  && why+="AppArmor could not be set up. "
+    [[ $SYS_STATUS == fail ]] && why+="The kernel settings could not be applied. "
+    (( BOOT_BROKEN ))         && why+="The boot settings could not be updated safely. "
+    if [[ -n $why ]]; then
+      for n in "${NOTES[@]}"; do log "NOTE: $n"; done
+      auto_rollback "${why% }"
+      exit 1
+    fi
+  fi
   if [[ $FW_STATUS == fail || $SYS_STATUS == fail ]]; then
     verdict=fail
   elif [[ $AA_STATUS == fail ]]; then
@@ -2032,13 +2384,6 @@ finish_enable() {
   box_bot "$bc"
   printf '\n'
 
-  if { [[ $verdict == fail ]] || (( BOOT_BROKEN )); } && (( ! DRY_RUN )); then
-    if (( BOOT_BROKEN )); then
-      offer_rollback Y "Something failed while changing your system, and the boot settings may be affected."
-    else
-      offer_rollback N "Part of the setup did not work."
-    fi
-  fi
 
   case $verdict in
     ok|partial|dry) exit 0 ;;
@@ -2096,7 +2441,8 @@ main() {
   require_root
   init_workdirs
   trap cleanup EXIT
-  trap on_interrupt INT TERM
+  start_stop_watcher
+  trap on_interrupt INT TERM USR1
   cursor_hide
   banner
   (( DRY_RUN )) && warn "DRY-RUN: I will only show what would happen. Nothing is changed."

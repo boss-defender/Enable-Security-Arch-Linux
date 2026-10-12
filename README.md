@@ -4,7 +4,7 @@
 
 **One script. A firewall, AppArmor and safe kernel hardening, with full undo.**
 
-![Version](https://img.shields.io/badge/version-3.0.3-blue)
+![Version](https://img.shields.io/badge/version-3.2.0-blue)
 ![Last updated](https://img.shields.io/badge/last%20updated-12%20Oct%202026-brightgreen)
 ![Shell](https://img.shields.io/badge/shell-bash-green)
 ![Init](https://img.shields.io/badge/requires-systemd-orange)
@@ -13,7 +13,7 @@
 
 </div>
 
-> 📅 **Last updated: 12 October 2026** (v3.0.3)
+> 📅 **Last updated: 12 October 2026** (v3.2.0)
 >
 > Arch and Arch-based distros change fast: boot loaders, packages and defaults move over time. If this date is more than about 6 months old, check the [commits](https://github.com/boss-defender/Enable-Security-Arch-Linux/commits/main) and [issues](https://github.com/boss-defender/Enable-Security-Arch-Linux/issues) before running, and test on a VM or snapshot first.
 
@@ -27,14 +27,17 @@ Run it once and your system gets a solid security baseline that survives every r
 |---|---|
 | 🔥 **Firewall (ufw)** | Blocks unrequested incoming connections and allows outgoing. A running SSH server is detected (including `sshd.socket`), and its port stays open with rate limiting so you can't lock yourself out. |
 | 🧱 **AppArmor** | Installs AppArmor, adds the correct `lsm=` setting to your boot loader and enables it at every boot. Profiles start in **complain (log-only)** mode, so your desktop won't break. |
+| 📚 **apparmor.d profiles** | Builds [apparmor.d](https://github.com/roddhjav/apparmor.d) (over 1500 profiles) from the AUR **automatically**, as your normal user, with no AUR helper needed. It checks the upstream signature and tunes the profile cache for a fast boot. |
 | ⚙️ **Kernel hardening** | Applies safe `sysctl` settings: hides kernel pointers and `dmesg`, restricts `ptrace`, turns on SYN cookies and reverse-path filtering, ignores ICMP redirects, and protects hard links and symlinks. |
 
 ## 🧠 Built to be safe
 
+- 🛟 **Fails safe, automatically.** If anything goes wrong, or the script crashes, it undoes everything on its own: original files come back, and the packages it installed are removed. Then it tells you: *"Sorry, I failed, but your system is safe."*
 - 💾 **Backs up every file before touching it.** Each one gets a `<file>.backup` copy, and a manifest records every change.
 - ↩️ **Full undo** with `--rollback`, `--disable` or `--uninstall`. Your original files come back exactly as they were.
 - 🩺 **Checks the boot menu** after every edit. If the new setting didn't reach it, the script offers to undo straight away.
 - 🔁 **Safe to run twice.** A second run changes nothing.
+- ✋ **Stop any time with `Ctrl+C` or `Ctrl+Z`.** The script finishes the step it's on, so pacman or your boot menu is never cut off halfway. Then it stops and offers to undo.
 - 🧪 **`--dry-run`** shows every step without changing anything.
 - 🔍 **Detects your boot loader on its own:** GRUB, systemd-boot (classic and UKI), and Limine (including Omarchy's `+=` lines and `/etc/limine-entry-tool.d/` drop-ins).
 - 🚧 **Respects what's already there.** It never mixes AppArmor with SELinux, keeps an active **firewalld** unless you pass `--force-ufw`, skips AppArmor on kernels built without it, and refuses to run inside containers.
@@ -69,11 +72,12 @@ sudo reboot                                     # one reboot switches AppArmor o
 | `-y`, `--yes` | Don't ask questions (safe defaults) |
 | `--dry-run` | Preview only |
 | `--force-ufw` | Replace an active firewalld with ufw (firewalld config is backed up) |
+| `--no-aur` | Skip building apparmor.d from the AUR |
 | `--no-color`, `-h`, `-V` | Plain output, help, version |
 
-## 🤖 Omarchy & AI agents
+## 🤖 AI agents (every supported system)
 
-On Omarchy and other agentic setups, AI agents such as coding assistants often need to edit system files, install packages or change configs. AppArmor in **enforce** mode can block the programs it has profiles for, which makes an agent's work fail in confusing ways.
+Whether you're on Arch, Manjaro, Omarchy, EndeavourOS or Garuda, AI agents such as coding assistants often need to edit system files, install packages or change configs. AppArmor in **enforce** mode can block the programs it has profiles for, which makes an agent's work fail in confusing ways.
 
 The **AI-agent switch** lets you choose:
 
@@ -108,21 +112,21 @@ The **AI-agent switch** lets you choose:
 
 **Requirements:** systemd, pacman, a kernel with AppArmor support (the stock `linux`, `linux-lts`, `linux-zen` and `linux-hardened` kernels have it), and internet access for packages.
 
-## 📚 Want more AppArmor profiles?
+## 📚 About apparmor.d
 
-Stock AppArmor ships only a few profiles. For broad desktop coverage, install [apparmor.d](https://github.com/roddhjav/apparmor.d) from the AUR as your normal user, then reboot:
+The script builds **apparmor.d** from the AUR on its own: it clones the package, builds it as the user who ran the script, and installs it with pacman. The build takes a few minutes. `go` and `just` are only needed for the build, so they're removed again afterwards. `base-devel` and `git` stay installed.
 
-```bash
-yay -S apparmor.d      # or: paru -S apparmor.d
-```
-
-It installs in complain mode. Test before you enforce.
+- Run the script as your **normal user**, not from a root shell. It asks for `sudo` itself.
+- On Garuda, a prebuilt apparmor.d from your repos is used when one is available.
+- Upstream officially supports GNOME, KDE and XFCE. On Hyprland (Omarchy) it stays safe in complain mode; test well before enforcing.
+- Prefer to skip it? Use `--no-aur`.
 
 ## 🗂️ Where things live
 
 | Path | Purpose |
 |---|---|
 | `/etc/sysctl.d/99-arch-security.conf` | Kernel hardening settings |
+| `/etc/apparmor/parser.conf` | Profile cache settings for apparmor.d (backed up first) |
 | `<file>.backup` | Original copy of every edited file |
 | `/var/lib/arch-security/` | State and change manifest (used for undo) |
 | `/var/log/arch-security.log` | Full log of every run |
