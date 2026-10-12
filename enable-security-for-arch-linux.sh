@@ -1,12 +1,33 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  enable-security-for-arch-linux.sh  —  v3.2.0
+#  enable-security-for-arch-linux.sh  —  v3.3.0
 # =============================================================================
 #  A production-grade security baseline for Arch-based systems.
 #  Supported: Arch Linux, Manjaro, Omarchy, EndeavourOS, Garuda Linux.
 #
 #  CachyOS IS NOT SUPPORTED. Do not run this script on CachyOS.
 #  Artix Linux is NOT SUPPORTED (no systemd).
+#
+#  v3.3.0 changes:
+#    - NEW: setup asks "apparmor.d on or off?" first. On -> it asks complain
+#      or enforce. Off -> apparmor.d is skipped (same as --no-aur).
+#    - NEW: --apparmor-d-on / --apparmor-d-off turn apparmor.d on or off later
+#      (AppArmor, firewall and kernel hardening stay as they are).
+#    - NEW: --complain / --enforce as clearer names for --allow-ai-agent /
+#      --disable-ai-agent (the old names still work).
+#    - NEW: --status shows apparmor.d on/off, the mode and for how many days;
+#      after 7 days in complain mode it gives the week-2 tip.
+#    - FIX: apparmor.d from the repos is no longer installed when the user
+#      chose off or gave --no-aur.
+#
+#  v3.2.2 changes:
+#    - NEW: a normal run asks whether AI agents are allowed (AppArmor
+#      complain / log-only, the default) or blocked (enforce). It shows the
+#      detected desktop and warns on Hyprland/Sway/i3/niri, where apparmor.d
+#      is not supported. Not asked with -y, without a terminal, or when
+#      --allow-ai-agent / --disable-ai-agent is given.
+#    - FIX: choosing "block" during setup now really switches the profiles to
+#      enforce (before, enforce was applied only by --disable-ai-agent alone).
 #
 #  v3.2.0 changes:
 #    - NEW: apparmor.d is built from the AUR automatically (as the normal
@@ -17,6 +38,10 @@
 #      finishes first (the AUR build is cancelled at once), then undo is offered.
 #    - CHANGE: the AI-agent switch is shown and works the same on every
 #      supported system, not only Omarchy.
+#    - FIX (3.2.1): profile mode switch no longer uses aa-enforce/aa-complain
+#      with apparmor.d ("Conflicting profiles for brave"); uses apparmor.d's
+#      /etc/apparmor/modes + aa-install, never touches unconfined placeholders,
+#      and repairs placeholders older versions switched by mistake.
 #    - NEW: if the setup fails (or the script crashes), everything is undone
 #      automatically and the user is told: "Sorry, I failed - but your system
 #      is safe". Original files come back; installed packages are removed.
@@ -84,7 +109,7 @@ umask 022
 # =============================================================================
 # SECTION 1: SETTINGS AND FILE LOCATIONS
 # =============================================================================
-SCRIPT_VERSION="3.2.0"
+SCRIPT_VERSION="3.3.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || true)"
 SCRIPT_FILE="${SCRIPT_PATH##*/}"
 [[ -n $SCRIPT_FILE ]] || SCRIPT_FILE="enable-security-for-arch-linux.sh"
@@ -114,6 +139,10 @@ SDBOOT_MANAGE_CONF="/etc/sdboot-manage.conf"
 UKI_CONF="/etc/kernel/uki.conf"
 APPARMOR_DIR="/etc/apparmor.d"
 APPARMOR_PARSER_CONF="/etc/apparmor/parser.conf"
+AAD_MODES_FILE="/etc/apparmor/modes"          # apparmor.d (aa-install) mode setting
+AAD_VENDOR_MODES="/usr/share/apparmor/modes"
+AAD_SRC_DIR="/usr/share/apparmor.d"
+PKG_CACHE_DIR="/var/cache/pacman/pkg"
 LSM_SYSFS="/sys/kernel/security/lsm"
 APPARMOR_SYSFS="/sys/kernel/security/apparmor"
 PROC_CMDLINE="/proc/cmdline"
@@ -138,6 +167,10 @@ if [[ "${ARCH_SEC_TESTING:-0}" == "1" ]]; then
   SDBOOT_MANAGE_CONF="${T_SDBOOT_MANAGE_CONF:-$SDBOOT_MANAGE_CONF}"
   UKI_CONF="${T_UKI_CONF:-$UKI_CONF}"
   APPARMOR_DIR="${T_APPARMOR_DIR:-$APPARMOR_DIR}"
+  AAD_MODES_FILE="${T_AAD_MODES_FILE:-$AAD_MODES_FILE}"
+  AAD_VENDOR_MODES="${T_AAD_VENDOR_MODES:-$AAD_VENDOR_MODES}"
+  AAD_SRC_DIR="${T_AAD_SRC_DIR:-$AAD_SRC_DIR}"
+  PKG_CACHE_DIR="${T_PKG_CACHE_DIR:-$PKG_CACHE_DIR}"
   LSM_SYSFS="${T_LSM_SYSFS:-$LSM_SYSFS}"
   APPARMOR_SYSFS="${T_APPARMOR_SYSFS:-$APPARMOR_SYSFS}"
   PROC_CMDLINE="${T_PROC_CMDLINE:-$PROC_CMDLINE}"
@@ -149,6 +182,8 @@ ASSUME_YES=0
 DRY_RUN=0
 FORCE_UFW=0
 NO_AUR=0
+AAD_ACTION_RUNNING=0 # 1 while --apparmor-d-on/off runs (Ctrl+C must not undo the whole setup)
+AAD_WANT=""         # 1 = apparmor.d on, 0 = off (asked during setup)
 OPT_NO_COLOR=0
 SHOW_HELP=0
 SHOW_VERSION=0
@@ -252,6 +287,15 @@ box_text() {
   while IFS= read -r line; do
     box_row "$bc" "${tc}${line}${C_RESET}"
   done < <(printf '%s\n' "$*" | fold -s -w $((UI_WIDTH - 4)))
+}
+
+# Like box_text, but every wrapped line is indented by 4 spaces.
+box_indent() {
+  local bc=$1 line
+  shift
+  while IFS= read -r line; do
+    box_row "$bc" "    ${line}"
+  done < <(printf '%s\n' "$*" | fold -s -w $((UI_WIDTH - 8)))
 }
 
 banner() {
@@ -483,6 +527,11 @@ safe_stop() {
   printf '\n'
   warn "Stopped safely before the script finished."
   aur_leftover_cleanup
+  if (( AAD_ACTION_RUNNING )); then
+    pkg_installed apparmor.d || state_del INSTALLED_APPARMOR_D
+    info "Your existing setup was not touched. apparmor.d is $(pkg_installed apparmor.d && echo ON || echo 'still OFF')."
+    exit 130
+  fi
   if [[ -t 0 ]] && manifest_nonempty && (( ! DRY_RUN )); then
     offer_rollback Y "You stopped the script while it was changing files."
   elif [[ -s ${STATE_FILE:-/nonexistent} ]] && (( ! DRY_RUN )); then
@@ -614,14 +663,14 @@ usage_error() {
 
 set_action() {
   if [[ -n $ACTION && $ACTION != "$1" ]]; then
-    usage_error "please choose only ONE of --enable, --disable, --uninstall, --rollback, --status."
+    usage_error "please choose only ONE of --enable, --disable, --uninstall, --rollback, --status, --apparmor-d-on, --apparmor-d-off."
   fi
   ACTION=$1
 }
 
 set_ai() {
   if [[ -n $AI_MODE && $AI_MODE != "$1" ]]; then
-    usage_error "--allow-ai-agent and --disable-ai-agent cannot be used together."
+    usage_error "--complain (--allow-ai-agent) and --enforce (--disable-ai-agent) cannot be used together."
   fi
   AI_MODE=$1
 }
@@ -634,8 +683,10 @@ parse_args() {
       --uninstall)          set_action uninstall ;;
       --rollback)           set_action rollback ;;
       --status)             set_action status ;;
-      --allow-ai-agent)     set_ai allowed ;;
-      --disable-ai-agent)   set_ai blocked ;;
+      --allow-ai-agent|--complain) set_ai allowed ;;
+      --disable-ai-agent|--enforce) set_ai blocked ;;
+      --apparmor-d-on)      set_action aadon ;;
+      --apparmor-d-off)     set_action aadoff ;;
       -y|--yes)             ASSUME_YES=1 ;;
       --dry-run)            DRY_RUN=1 ;;
       --force-ufw)          FORCE_UFW=1 ;;
@@ -651,7 +702,7 @@ parse_args() {
     if [[ -n $AI_MODE ]]; then ACTION=ai; else ACTION=enable; fi
   fi
   if [[ -n $AI_MODE && $ACTION != enable && $ACTION != ai ]]; then
-    usage_error "the AI-agent options only work together with the normal install, or on their own."
+    usage_error "--complain / --enforce only work together with the normal install, or on their own."
   fi
 }
 
@@ -673,13 +724,22 @@ ${C_BOLD}MAIN COMMANDS${C_RESET}  (choose one; no option = install and enable)
   --rollback           Undo only my file edits and switch off what I enabled.
   --status             Show what is installed and active right now.
 
-${C_BOLD}AI-AGENT SWITCH${C_RESET}  (works on Arch, Manjaro, Omarchy, EndeavourOS and Garuda)
-  --allow-ai-agent     AppArmor profiles go from "enforce" to "complain" (log only).
+${C_BOLD}APPARMOR.D${C_RESET}  (1500+ extra AppArmor profiles)
+  --apparmor-d-on      Install apparmor.d and turn it on.
+  --apparmor-d-off     Remove apparmor.d (AppArmor, firewall, kernel settings stay).
+
+${C_BOLD}MODE SWITCH${C_RESET}  (works on Arch, Manjaro, Omarchy, EndeavourOS and Garuda)
+  --complain, --allow-ai-agent
+                       AppArmor profiles go to "complain" (log only).
                        NOTE: This only affects programs that HAVE a profile.
                        Unprofiled programs are not confined either way.
-                       On pure Arch, apparmor.d (AUR) installs in complain mode
-                       by default. This switch is mainly for enforcing setups.
-  --disable-ai-agent   Back to the most secure mode (AppArmor enforcing).
+  --enforce, --disable-ai-agent
+                       The most secure mode (AppArmor blocks).
+                       Don't use it on Hyprland (Omarchy), Sway or i3.
+  A normal run asks: apparmor.d on/off, then complain/enforce (defaults:
+  on, complain). With -y, or with one of these options, it does not ask.
+  Recommended: week 1 complain, check "sudo aa-log", week 2 enforce
+  (KDE Plasma, GNOME, XFCE only).
 
 ${C_BOLD}EXTRA OPTIONS${C_RESET}
   -y, --yes            Do not ask questions.
@@ -1506,19 +1566,118 @@ aa_undo() {
   return 0
 }
 
-aa_set_mode() {
-  local mode=$1 files=()
-  have aa-complain && have aa-enforce || { echo "The AppArmor tools (aa-complain / aa-enforce) are missing."; return 1; }
-  mapfile -t files < <(
-    find "$APPARMOR_DIR" -maxdepth 1 -type f ! -name '.*' ! -name '*.pacnew' ! -name '*.pacsave' ! -name '*.pacorig' ! -name '*~' -print0 2>/dev/null |
-    while IFS= read -r -d '' f; do
-      if grep -qE '^\s*profile\s' "$f" 2>/dev/null; then
-        printf '%s\n' "$(basename "$f")"
+# --- Switching AppArmor profiles between complain and enforce -----------------
+# FIX v3.2.1: aa-complain / aa-enforce must NOT be used with apparmor.d.
+#  * apparmor.d replaces some upstream profiles (brave, chrome, opera, ...):
+#    it installs its own copy as <name>.apparmor.d and disables the upstream
+#    one. aa-enforce does not understand disabled profiles and stops with
+#    "Conflicting profiles for brave defined in two files" (apparmor.d #727;
+#    upstream says: set the mode through apparmor.d itself).
+#  * apparmor.d's pacman hook re-runs "aa-install --install" after every
+#    package transaction, so aa-complain/aa-enforce changes would be lost.
+#  * The upstream apparmor package ships many placeholder profiles with
+#    flags=(unconfined) (only to allow user namespaces). They must never be
+#    switched to complain or enforce: enforcing them breaks those programs.
+# So: with apparmor.d, write the mode to /etc/apparmor/modes and let
+# aa-install rebuild the profiles. Without it, only switch real profiles.
+
+aa_is_disabled() { [[ -e $APPARMOR_DIR/disable/$1 ]]; }
+
+# Real profiles in /etc/apparmor.d that may be switched: not disabled, not an
+# unconfined placeholder, not a backup/pacman leftover.
+aa_switchable_profiles() {
+  local f b
+  while IFS= read -r -d '' f; do
+    b=${f##*/}
+    aa_is_disabled "$b" && continue
+    grep -qE '^[[:space:]]*profile[[:space:]]' "$f" 2>/dev/null || continue
+    grep -qE '^[[:space:]]*profile[[:space:]].*flags=\([^)]*unconfined' "$f" 2>/dev/null && continue
+    printf '%s\n' "$b"
+  done < <(find "$APPARMOR_DIR" -maxdepth 1 -type f ! -name '.*' ! -name '*.pacnew' ! -name '*.pacsave' \
+             ! -name '*.pacorig' ! -name '*~' ! -name '*.backup' ! -name '*.backup.*' -print0 2>/dev/null)
+}
+
+# Repair damage from v3.2.0 and older: those versions ran aa-complain on every
+# file, which turned upstream flags=(unconfined) placeholders into complain
+# mode. Put such a file back to the packaged version ONLY when the flags are
+# the sole difference (so a user's own edits are never touched). Best effort.
+aa_repair_upstream_flags() {
+  local ver pkgf tmp f b cur fixed=0
+  (( DRY_RUN )) && return 0
+  have pacman && have bsdtar || return 0
+  ver=$(pacman -Q apparmor 2>/dev/null | awk '{print $2}') || return 0
+  [[ -n $ver ]] || return 0
+  pkgf=$(ls -1 "$PKG_CACHE_DIR"/apparmor-"$ver"-*.pkg.tar.* 2>/dev/null | grep -v '\.sig$' | head -n1)
+  [[ -n $pkgf && -f $pkgf ]] || return 0
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/asec-aafix.XXXXXX") || return 0
+  if bsdtar -xf "$pkgf" -C "$tmp" etc/apparmor.d 2>/dev/null; then
+    for f in "$tmp"/etc/apparmor.d/*; do
+      [[ -f $f ]] || continue
+      b=${f##*/}; cur=$APPARMOR_DIR/$b
+      [[ -f $cur ]] || continue
+      grep -qE '^[[:space:]]*profile[[:space:]].*flags=\([^)]*unconfined' "$f" || continue
+      cmp -s "$f" "$cur" && continue
+      if [[ "$(sed -E 's/[[:space:]]*flags=\([^)]*\)//' "$f")" == "$(sed -E 's/[[:space:]]*flags=\([^)]*\)//' "$cur")" ]]; then
+        # Keep a copy OUTSIDE /etc/apparmor.d (AppArmor would load a copy in
+        # there as a second profile), and do not list it for rollback: a
+        # rollback must never bring the broken flags back.
+        mkdir -p "$STATE_DIR/repaired-profiles" && cp -p -- "$cur" "$STATE_DIR/repaired-profiles/$b.$(date +%Y%m%d%H%M%S)" || continue
+        cat "$f" >"$cur" && fixed=$(( fixed + 1 )) && echo "Restored the packaged (unconfined) version of $cur"
       fi
     done
-  )
-  if (( ${#files[@]} == 0 )); then echo "No actual profiles in $APPARMOR_DIR yet - nothing to switch."; return 0; fi
-  if [[ $mode == allowed ]]; then aa-complain "${files[@]}"; else aa-enforce "${files[@]}"; fi
+  fi
+  rm -rf -- "$tmp"
+  (( fixed )) && echo "Repaired $fixed upstream placeholder profile(s)."
+  return 0
+}
+
+aad_has_tools() { have aa-install && [[ -d $AAD_SRC_DIR ]]; }
+
+# Write "default complain|enforce" to /etc/apparmor/modes. aa-install reads
+# only ONE modes file (the admin one wins whole), so start from the vendor
+# file to keep its other keys.
+aad_write_mode() {
+  local want=$1 tmp
+  track_file "$AAD_MODES_FILE" || return 1
+  mkdir -p "${AAD_MODES_FILE%/*}" || return 1
+  tmp=$(mktemp "${TMPDIR:-/tmp}/asec-modes.XXXXXX") || return 1
+  if [[ -f $AAD_MODES_FILE ]]; then cat "$AAD_MODES_FILE" >"$tmp"
+  elif [[ -f $AAD_VENDOR_MODES ]]; then cat "$AAD_VENDOR_MODES" >"$tmp"
+  else printf 'include default\nreload yes\nfsp no\n' >"$tmp"; fi
+  if grep -qE '^[[:space:]]*default[[:space:]]' "$tmp"; then
+    sed -i -E "s/^[[:space:]]*default[[:space:]].*/default ${want}/" "$tmp"
+  else
+    [[ -s $tmp && $(tail -c1 "$tmp" | od -An -c | tr -d ' ') != '\n' ]] && printf '\n' >>"$tmp"
+    printf 'default %s\n' "$want" >>"$tmp"
+  fi
+  cat "$tmp" >"$AAD_MODES_FILE" && rm -f "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 644 "$AAD_MODES_FILE"
+  seal_file "$AAD_MODES_FILE"
+}
+
+aa_set_mode() {
+  local mode=$1 want files=()
+  [[ $mode == allowed ]] && want=complain || want=enforce
+  aa_repair_upstream_flags
+  if aad_has_tools; then
+    echo "apparmor.d detected: setting its mode to '${want}' in ${AAD_MODES_FILE} and rebuilding the profiles."
+    aad_write_mode "$want" || { echo "Could not write ${AAD_MODES_FILE}."; return 1; }
+    aa-install --install || { echo "aa-install failed (see the lines above)."; return 1; }
+    return 0
+  fi
+  if pkg_installed apparmor.d; then
+    if [[ $want == complain ]]; then
+      echo "This apparmor.d version installs its profiles in complain mode already - nothing to switch."
+      return 0
+    fi
+    echo "Your apparmor.d package is too old to switch modes safely (it has no aa-install tool)."
+    echo "Update it from the AUR (run this script again without --no-aur, or rebuild apparmor.d), then try again."
+    return 1
+  fi
+  have aa-complain && have aa-enforce || { echo "The AppArmor tools (aa-complain / aa-enforce) are missing."; return 1; }
+  mapfile -t files < <(aa_switchable_profiles)
+  if (( ${#files[@]} == 0 )); then echo "No real profiles in $APPARMOR_DIR to switch."; return 0; fi
+  ( cd "$APPARMOR_DIR" && if [[ $want == complain ]]; then aa-complain "${files[@]}"; else aa-enforce "${files[@]}"; fi )
 }
 
 resolve_ai_mode() {
@@ -1790,6 +1949,186 @@ run_rollback() {
 # =============================================================================
 # SECTION 14: THE ACTIONS
 # =============================================================================
+# Install apparmor.d (from the repos when they have it, else built from the
+# AUR as the normal user). Honours AAD_WANT=0 (user chose "off").
+aad_install_step() {
+  local bu
+  if pkg_installed apparmor.d; then
+    if [[ $AAD_WANT == 0 ]]; then
+      skip_step "Installing AppArmor profiles (apparmor.d)" "you chose off, but it was already installed; use --apparmor-d-off to remove it"
+    else
+      skip_step "Installing AppArmor profiles (apparmor.d)" "already installed"
+    fi
+    return 0
+  fi
+  if [[ $AAD_WANT == 0 ]]; then
+    skip_step "Installing AppArmor profiles (apparmor.d)" "$( (( NO_AUR )) && echo '--no-aur given' || echo 'you chose off')"
+    add_note "apparmor.d is off. Turn it on any time with: ./${SCRIPT_FILE} --apparmor-d-on"
+    return 0
+  fi
+  if pacman -Si apparmor.d >/dev/null 2>&1; then
+    state_set INSTALLED_APPARMOR_D 1
+    run_step "Installing AppArmor profiles (apparmor.d)" pkg_install apparmor.d \
+      || { state_set INSTALLED_APPARMOR_D 0; add_note "apparmor.d could not be installed; AppArmor will have very few profiles."; }
+    return 0
+  fi
+  bu=$(aur_build_user)
+  if [[ -z $bu ]]; then
+    skip_step "Installing AppArmor profiles (apparmor.d)" "no normal user to build it as"
+    add_note "apparmor.d is built from the AUR as a normal user. Run this script as your normal user (it asks for sudo itself) to install it automatically."
+    return 0
+  fi
+  state_set INSTALLED_APPARMOR_D 1
+  STEP_KILLABLE=1
+  run_step "Building and installing AppArmor profiles (apparmor.d, from the AUR, a few minutes)" aur_install_apparmor_d "$bu" \
+    || { state_set INSTALLED_APPARMOR_D 0; add_note "apparmor.d could not be built from the AUR; details are in $LOG_FILE. AppArmor still works with the stock profiles."; }
+  STEP_KILLABLE=0; mark_clear no_kill
+  return 0
+}
+
+# Ask, during a normal run, whether apparmor.d should be on or off.
+choose_aad() {
+  (( AA_KERNEL_SUPPORTED )) || return 0
+  local saved def ans tries=0
+  if (( NO_AUR )); then AAD_WANT=0; return 0; fi
+  saved=$(state_get APPARMOR_D 2>/dev/null || true)
+  [[ $saved == off ]] && def=2 || def=1
+  if (( ASSUME_YES )) || [[ ! -t 0 ]]; then
+    [[ $def == 2 ]] && AAD_WANT=0 || AAD_WANT=1
+    return 0
+  fi
+  printf '\n'
+  box_top "$C_BLUE"
+  box_row "$C_BLUE" "${C_BOLD}APPARMOR.D  -  1500+ EXTRA SECURITY PROFILES${C_RESET}"
+  box_sep "$C_BLUE"
+  box_text "$C_BLUE" "$C_DIM" "AppArmor alone has rules for only a few programs. apparmor.d gives over 1500 programs their own rulebook, so a hacked app can't reach the rest of your system."
+  box_row "$C_BLUE" ""
+  box_row "$C_BLUE" "${C_GREEN}${C_BOLD}[1] On${C_RESET}   ${C_DIM}(recommended)${C_RESET}"
+  box_indent "$C_BLUE" "Install apparmor.d. Next you pick complain or enforce mode."
+  box_row "$C_BLUE" ""
+  box_row "$C_BLUE" "${C_BOLD}[2] Off${C_RESET}"
+  box_indent "$C_BLUE" "Skip it. AppArmor keeps only its few built-in profiles."
+  box_sep "$C_BLUE"
+  box_text "$C_BLUE" "$C_DIM" "Change it later: --apparmor-d-on / --apparmor-d-off"
+  box_bot "$C_BLUE"
+  cursor_show
+  while :; do
+    ans=""
+    read -r -p "  Your choice [1/2] (Enter = ${def}): " ans || { ans=$def; printf '\n'; }
+    ans=${ans//[[:space:]]/}
+    [[ -z $ans ]] && ans=$def
+    case ${ans,,} in
+      1|on|y|yes) AAD_WANT=1; break ;;
+      2|off|n|no) AAD_WANT=0; break ;;
+    esac
+    tries=$(( tries + 1 ))
+    if (( tries >= 3 )); then
+      [[ $def == 2 ]] && AAD_WANT=0 || AAD_WANT=1
+      warn "No valid answer - keeping option ${def}."
+      break
+    fi
+    warn "Please type 1 or 2."
+  done
+  cursor_hide
+  if (( AAD_WANT )); then good "apparmor.d: ON"; else good "apparmor.d: OFF"; fi
+  return 0
+}
+
+# Which desktop is running? apparmor.d officially supports only GNOME, KDE
+# Plasma and XFCE. Under sudo XDG_CURRENT_DESKTOP is usually gone, so look
+# at the running processes too. Prints "Name|supported" or "Name|other".
+detect_desktop() {
+  local d="${XDG_CURRENT_DESKTOP:-}:${DESKTOP_SESSION:-}:${XDG_SESSION_DESKTOP:-}"
+  d=${d,,}
+  if have pgrep; then
+    pgrep -x Hyprland  >/dev/null 2>&1 && d+=":hyprland"
+    pgrep -x sway      >/dev/null 2>&1 && d+=":sway"
+    pgrep -x i3        >/dev/null 2>&1 && d+=":i3"
+    pgrep -x niri      >/dev/null 2>&1 && d+=":niri"
+    pgrep -x plasmashell >/dev/null 2>&1 && d+=":kde"
+    pgrep -x gnome-shell >/dev/null 2>&1 && d+=":gnome"
+    pgrep -x xfce4-session >/dev/null 2>&1 && d+=":xfce"
+  fi
+  case $d in
+    *hyprland*) echo "Hyprland|other" ;;
+    *sway*)     echo "Sway|other" ;;
+    *niri*)     echo "niri|other" ;;
+    *i3*)       echo "i3|other" ;;
+    *kde*|*plasma*) echo "KDE Plasma|supported" ;;
+    *gnome*)    echo "GNOME|supported" ;;
+    *xfce*)     echo "XFCE|supported" ;;
+    *)          if is_omarchy; then echo "Hyprland|other"; else echo "unknown|unknown"; fi ;;
+  esac
+}
+
+# Ask, during a normal run, whether AI agents may work freely (AppArmor
+# complain / log-only) or are blocked (AppArmor enforce). Only asked when the
+# mode was not given on the command line, not with -y, and only on a terminal.
+choose_ai_mode() {
+  (( AA_KERNEL_SUPPORTED )) || return 0
+  [[ -n $AI_MODE ]] && return 0
+  [[ $AAD_WANT == 0 ]] && ! pkg_installed apparmor.d && return 0
+  local saved def ans tries=0 info dname dsup
+  saved=$(state_get AI_AGENT 2>/dev/null || true)
+  [[ $saved == blocked ]] && def=2 || def=1
+  if (( ASSUME_YES )) || [[ ! -t 0 ]]; then return 0; fi
+  info=$(detect_desktop); dname=${info%%|*}; dsup=${info##*|}
+
+  printf '\n'
+  box_top "$C_MAGENTA"
+  box_row "$C_MAGENTA" "${C_BOLD}APPARMOR MODE  -  AI AGENTS ALLOWED OR BLOCKED?${C_RESET}"
+  box_sep "$C_MAGENTA"
+  box_text "$C_MAGENTA" "$C_DIM" "AI coding agents can edit system files, install packages and change configs. AppArmor can let them work, or block the programs it has rules for."
+  box_row "$C_MAGENTA" ""
+  box_row "$C_MAGENTA" "${C_GREEN}${C_BOLD}[1] Complain${C_RESET} = AI agents allowed  ${C_DIM}(recommended)${C_RESET}"
+  box_indent "$C_MAGENTA" "AppArmor only LOGS what it would block. Nothing breaks."
+  box_row "$C_MAGENTA" ""
+  box_row "$C_MAGENTA" "${C_RED}${C_BOLD}[2] Enforce${C_RESET}  = AI agents blocked  ${C_DIM}(maximum protection)${C_RESET}"
+  box_indent "$C_MAGENTA" "AppArmor BLOCKS profiled programs that break their rules. Agents and some apps may fail."
+  box_sep "$C_MAGENTA"
+  case $dsup in
+    other)     box_text "$C_MAGENTA" "$C_YELLOW" "Your desktop: ${dname}. apparmor.d does not support it, so choose 1. Blocking can break apps or the desktop itself." ;;
+    supported) box_text "$C_MAGENTA" "$C_DIM" "Your desktop: ${dname} (supported). Best plan: week 1 complain, check 'sudo aa-log', week 2 enforce." ;;
+    *)         box_text "$C_MAGENTA" "$C_DIM" "Desktop not detected. If unsure, choose 1." ;;
+  esac
+  box_text "$C_MAGENTA" "$C_DIM" "Firewall and kernel hardening stay on either way. Switch any time: --complain / --enforce"
+  box_bot "$C_MAGENTA"
+
+  cursor_show
+  while :; do
+    ans=""
+    read -r -p "  Your choice [1/2] (Enter = ${def}): " ans || { ans=$def; printf '\n'; }
+    ans=${ans//[[:space:]]/}
+    [[ -z $ans ]] && ans=$def
+    case ${ans,,} in
+      1|a|allow) AI_MODE=allowed; break ;;
+      2|b|block) AI_MODE=blocked; break ;;
+    esac
+    tries=$(( tries + 1 ))
+    if (( tries >= 3 )); then
+      [[ $def == 2 ]] && AI_MODE=blocked || AI_MODE=allowed
+      warn "No valid answer - keeping option ${def}."
+      break
+    fi
+    warn "Please type 1 or 2."
+  done
+  if [[ $AI_MODE == blocked && $dsup != supported ]]; then
+    if [[ $dsup == other ]]; then
+      warn "Blocking on ${dname} may break apps or your desktop."
+    else
+      warn "Desktop not detected. Blocking is only safe on KDE Plasma, GNOME or XFCE."
+    fi
+    if ! ask_yes_no "Block anyway?" N; then AI_MODE=allowed; fi
+  fi
+  cursor_hide
+  if [[ $AI_MODE == allowed ]]; then
+    good "Mode: COMPLAIN - AI agents allowed (AppArmor logs only)."
+  else
+    good "Mode: ENFORCE - AI agents blocked (AppArmor enforces its rules)."
+  fi
+  return 0
+}
+
 show_enable_plan() {
   section "What I am about to do"
   if [[ $FW_MODE == keep ]]; then
@@ -1799,7 +2138,7 @@ show_enable_plan() {
   fi
   if (( AA_KERNEL_SUPPORTED )); then
     info "AppArmor: install it and switch it on at boot (one reboot needed)."
-    info "AI-agent switch: works on every supported system (--allow-ai-agent / --disable-ai-agent)."
+    info "Mode: switch any time with --complain / --enforce."
   else
     warn "AppArmor: SKIPPED — this kernel was built without AppArmor."
     warn "Firewall and kernel hardening will still be applied."
@@ -1815,13 +2154,18 @@ show_enable_plan() {
   if (( ! AA_KERNEL_SUPPORTED )); then
     :
   elif pkg_installed apparmor.d || [[ $(state_get INSTALLED_APPARMOR_D 2>/dev/null) == 1 ]]; then
-    info "apparmor.d is installed; it ships with all profiles in COMPLAIN mode by default."
-    info "This means AppArmor will only log violations, not block them, until you enforce manually."
+    info "apparmor.d is installed; its profiles follow the mode chosen above."
   else
-    if (( NO_AUR )) || [[ -z $(aur_build_user) ]]; then
+    if [[ $AAD_WANT == 0 ]]; then
+      info "apparmor.d: OFF (turn it on later with --apparmor-d-on)."
+    elif [[ -z $(aur_build_user) ]] && ! pacman -Si apparmor.d >/dev/null 2>&1; then
       info "For full coverage, install apparmor.d from the AUR after setup."
     else
-      info "apparmor.d (over 1500 profiles) will be built from the AUR as your normal user (a few minutes)."
+      if pacman -Si apparmor.d >/dev/null 2>&1; then
+        info "apparmor.d (over 1500 profiles) will be installed from your package repositories."
+      else
+        info "apparmor.d (over 1500 profiles) will be built from the AUR as your normal user (a few minutes)."
+      fi
     fi
   fi
   info "Backups: before editing a file I save a copy next to it, named <file>.backup."
@@ -1834,6 +2178,8 @@ do_enable() {
   local fw_ok=1 aa_ok=1 kp_ok=1 sys_ok=1 prev
 
   decide_firewall
+  choose_aad
+  choose_ai_mode
   resolve_ai_mode
   show_enable_plan
   ask_yes_no "Continue?" Y || { info "Okay, nothing was changed."; exit 0; }
@@ -1884,29 +2230,8 @@ do_enable() {
     run_step "Installing AppArmor" pkg_install apparmor || aa_ok=0
 
     if (( aa_ok )); then
-      if pkg_installed apparmor.d; then
-        skip_step "Installing AppArmor profiles (apparmor.d)" "already installed"
-      elif pacman -Si apparmor.d >/dev/null 2>&1; then
-        state_set INSTALLED_APPARMOR_D 1
-        run_step "Installing AppArmor profiles (apparmor.d)" pkg_install apparmor.d || add_note "apparmor.d could not be installed; AppArmor will have very few profiles."
-      else
-        local bu
-        bu=$(aur_build_user)
-        if (( NO_AUR )); then
-          skip_step "Installing AppArmor profiles (apparmor.d)" "--no-aur given"
-          add_note "For full AppArmor protection, install 'apparmor.d' from the AUR (yay -S apparmor.d), then reboot."
-        elif [[ -z $bu ]]; then
-          skip_step "Installing AppArmor profiles (apparmor.d)" "no normal user to build it as"
-          add_note "apparmor.d is built from the AUR as a normal user. Run this script as your normal user (it asks for sudo itself) to install it automatically."
-        else
-          state_set INSTALLED_APPARMOR_D 1
-          STEP_KILLABLE=1
-          run_step "Building and installing AppArmor profiles (apparmor.d, from the AUR, a few minutes)" aur_install_apparmor_d "$bu" \
-            || { state_set INSTALLED_APPARMOR_D 0; add_note "apparmor.d could not be built from the AUR; details are in $LOG_FILE. AppArmor still works with the stock profiles."; }
-          STEP_KILLABLE=0; mark_clear no_kill
-        fi
-      fi
-      if pkg_installed apparmor.d || { (( DRY_RUN )) && (( ! NO_AUR )); }; then
+      aad_install_step
+      if pkg_installed apparmor.d || { (( DRY_RUN )) && [[ $AAD_WANT != 0 ]]; }; then
         run_step "Tuning AppArmor for apparmor.d (fast profile cache, backup first)" aa_parser_conf_tune \
           || add_note "Could not tune $APPARMOR_PARSER_CONF; boot may be a little slower with apparmor.d."
       else
@@ -1916,6 +2241,8 @@ do_enable() {
       skip_step "Installing AppArmor profiles (apparmor.d)" "the AppArmor package is missing"
       skip_step "Tuning AppArmor for apparmor.d" "the AppArmor package is missing"
     fi
+    if pkg_installed apparmor.d; then state_set APPARMOR_D on
+    elif [[ $AAD_WANT == 0 ]]; then state_set APPARMOR_D off; fi
 
     if (( ! aa_ok )); then
       skip_step "Enabling AppArmor in the boot settings" "the AppArmor package is missing"; kp_ok=0
@@ -1949,8 +2276,11 @@ do_enable() {
       if [[ $AI_MODE == allowed ]]; then
         state_set AI_AGENT_PENDING 1
         add_note "After the reboot, run './${SCRIPT_FILE}' once more to put the AppArmor profiles in complain (log-only) mode."
+      else
+        state_set AI_AGENT_PENDING 1
+        add_note "After the reboot, run './${SCRIPT_FILE}' once more to switch the AppArmor profiles to enforce (block) mode."
       fi
-    elif [[ $AI_MODE == allowed && ( $prev != allowed || $(state_get AI_AGENT_PENDING 2>/dev/null) == 1 ) ]]; then
+    elif [[ $AI_MODE != "$prev" || $(state_get AI_AGENT_PENDING 2>/dev/null) == 1 ]]; then
       if run_step "Applying the AppArmor profile mode (${AI_MODE})" aa_set_mode "$AI_MODE"; then
         state_del AI_AGENT_PENDING
       else
@@ -1959,6 +2289,7 @@ do_enable() {
     else
       skip_step "Applying the AppArmor profile mode" "already in the desired mode"
     fi
+    [[ $prev != "$AI_MODE" || -z $(state_get AI_AGENT_SINCE 2>/dev/null) ]] && state_set AI_AGENT_SINCE "$(date +%s)"
     state_set AI_AGENT "$AI_MODE"
 
     if (( aa_ok && kp_ok )); then AA_STATUS=ok; else AA_STATUS=fail; fi
@@ -2196,12 +2527,19 @@ do_ai() {
     warn "This only affects programs that HAVE an AppArmor profile. Unprofiled programs are unaffected."
   else
     info "Enforce mode: AppArmor blocks policy violations (most secure)."
+    if pkg_installed apparmor.d; then
+      warn "apparmor.d's authors say: use complain mode for about a week and check 'aa-log' first."
+      warn "apparmor.d officially supports GNOME, KDE and XFCE. On other desktops (Hyprland/Omarchy, Sway, ...)"
+      warn "some programs, or the desktop itself, may be blocked. Undo with: ./${SCRIPT_FILE} --allow-ai-agent"
+      ask_yes_no "Switch apparmor.d to enforce mode anyway?" N || { info "Okay, nothing was changed."; exit 0; }
+    fi
   fi
   if ! pkg_installed apparmor; then
     state_set AI_AGENT "$AI_MODE"
     step_final warn "AppArmor is not installed yet" "(setting saved; run ./${SCRIPT_FILE} to install)"
     return 0
   fi
+  [[ $(state_get AI_AGENT 2>/dev/null) != "$AI_MODE" ]] && state_set AI_AGENT_SINCE "$(date +%s)"
   fg_step "Saving the setting" state_set AI_AGENT "$AI_MODE"
   if aa_active; then
     run_step "Switching the AppArmor profiles" aa_set_mode "$AI_MODE"
@@ -2210,6 +2548,78 @@ do_ai() {
   fi
   if (( STEP_FAILS )); then finish_simple_fail "The profile mode could not be applied" "See ${LOG_FILE}."
   else finish_simple "AppArmor profile mode is now: ${AI_MODE}" "$([[ $AI_MODE == allowed ]] && echo 'AppArmor only logs. The firewall is unchanged.' || echo 'AppArmor is blocking again (most secure).')"; fi
+}
+
+# --apparmor-d-on: install apparmor.d on a system that already has AppArmor.
+do_aad_on() {
+  STEP_TOTAL=3
+  section "apparmor.d: turning ON"
+  if (( ! AA_KERNEL_SUPPORTED )); then
+    finish_simple_fail "apparmor.d can't be used here" "This kernel was built without AppArmor. Use the standard 'linux' or 'linux-lts' kernel."
+  fi
+  if ! pkg_installed apparmor; then
+    finish_simple_fail "AppArmor is not set up yet" "Run ./${SCRIPT_FILE} first (it asks about apparmor.d during setup)."
+  fi
+  if pkg_installed apparmor.d; then
+    state_set APPARMOR_D on
+    finish_simple "apparmor.d is already ON" "Switch its mode with --complain or --enforce."
+  fi
+  info "This installs apparmor.d (over 1500 profiles). From the AUR it takes a few minutes."
+  info "Its profiles start in the mode you chose before: $( [[ $(state_get AI_AGENT 2>/dev/null) == blocked ]] && echo 'ENFORCE' || echo 'COMPLAIN (log only)')."
+  ask_yes_no "Turn apparmor.d on now?" Y || { info "Okay, nothing was changed."; exit 0; }
+  AAD_ACTION_RUNNING=1
+  AAD_WANT=1
+  aad_install_step
+  if (( DRY_RUN )); then finish_simple "Dry-run finished" "Nothing was changed."; fi
+  if ! pkg_installed apparmor.d; then
+    finish_simple_fail "apparmor.d could not be installed" "Nothing else was changed. Details: ${LOG_FILE}"
+  fi
+  state_set APPARMOR_D on
+  run_step "Tuning AppArmor for apparmor.d (fast profile cache, backup first)" aa_parser_conf_tune \
+    || add_note "Could not tune $APPARMOR_PARSER_CONF."
+  resolve_ai_mode
+  if aa_active; then
+    run_step "Applying the AppArmor profile mode (${AI_MODE})" aa_set_mode "$AI_MODE" \
+      || add_note "The profile mode could not be applied; run --complain or --enforce again."
+  else
+    skip_step "Applying the AppArmor profile mode" "AppArmor starts after the reboot"
+    state_set AI_AGENT_PENDING 1
+  fi
+  NEED_REBOOT=1
+  finish_simple "apparmor.d is ON" "Mode: $( [[ $AI_MODE == blocked ]] && echo 'ENFORCE (blocking)' || echo 'COMPLAIN (log only)'). Reboot so every profile is loaded."
+}
+
+# --apparmor-d-off: remove apparmor.d. AppArmor itself, the firewall and the
+# kernel hardening stay on.
+do_aad_off() {
+  local line
+  STEP_TOTAL=3
+  section "apparmor.d: turning OFF"
+  if ! pkg_installed apparmor.d; then
+    state_set APPARMOR_D off
+    finish_simple "apparmor.d is already OFF" "Turn it on any time with --apparmor-d-on."
+  fi
+  info "This removes the apparmor.d package and its 1500+ profiles."
+  info "AppArmor (with its few built-in profiles), the firewall and the kernel hardening stay on."
+  ask_yes_no "Turn apparmor.d off now?" Y || { info "Okay, nothing was changed."; exit 0; }
+  AAD_ACTION_RUNNING=1
+  run_step "Removing the apparmor.d package" pkg_remove apparmor.d \
+    || finish_simple_fail "apparmor.d could not be removed" "Nothing else was changed. Details: ${LOG_FILE}"
+  if line=$(manifest_find "$AAD_MODES_FILE"); then
+    run_step "Restoring ${AAD_MODES_FILE}" restore_entry "$line" 1
+  else
+    skip_step "Restoring ${AAD_MODES_FILE}" "I never changed it"
+  fi
+  if line=$(manifest_find "$APPARMOR_PARSER_CONF"); then
+    run_step "Restoring ${APPARMOR_PARSER_CONF}" restore_entry "$line" 1
+  else
+    skip_step "Restoring ${APPARMOR_PARSER_CONF}" "I never changed it"
+  fi
+  state_del INSTALLED_APPARMOR_D
+  state_del AI_AGENT_PENDING
+  state_set APPARMOR_D off
+  NEED_REBOOT=1
+  finish_simple "apparmor.d is OFF" "Its profiles stay loaded until you reboot. Turn it back on with --apparmor-d-on."
 }
 
 status_row() {
@@ -2248,9 +2658,25 @@ do_status() {
   if [[ -s $SYSCTL_FILE ]]; then status_row "Kernel hardening" ok "applied ($SYSCTL_FILE)"
   else status_row "Kernel hardening" off "not applied"; fi
 
+  if pkg_installed apparmor.d; then status_row "apparmor.d" ok "ON (1500+ profiles)"
+  else status_row "apparmor.d" off "OFF (turn on: --apparmor-d-on)"; fi
+
+  local since days dinfo
+  since=$(state_get AI_AGENT_SINCE 2>/dev/null || true)
+  days=""; [[ $since =~ ^[0-9]+$ ]] && days=$(( ( $(date +%s) - since ) / 86400 ))
   case $(state_get AI_AGENT 2>/dev/null || echo allowed) in
-    allowed) status_row "AppArmor profiles" warn "COMPLAIN (log only)" ;;
-    *)       status_row "AppArmor profiles" ok "ENFORCE (most secure)" ;;
+    blocked) status_row "Mode" ok "ENFORCE - AI agents blocked${days:+ (for $days days)}" ;;
+    *)       status_row "Mode" warn "COMPLAIN - AI agents allowed, log only${days:+ (for $days days)}"
+             if pkg_installed apparmor.d && [[ -n $days ]] && (( days >= 7 )); then
+               dinfo=$(detect_desktop)
+               if [[ ${dinfo##*|} == supported ]]; then
+                 printf '    %sWeek 1 is done. If "sudo aa-log" shows little or nothing, switch on: --enforce%s
+' "$C_DIM" "$C_RESET"
+               elif [[ ${dinfo##*|} == other ]]; then
+                 printf '    %sOn %s, stay in complain mode.%s
+' "$C_DIM" "${dinfo%%|*}" "$C_RESET"
+               fi
+             fi ;;
   esac
 
   if manifest_nonempty; then
@@ -2455,6 +2881,8 @@ main() {
     rollback)  do_rollback ;;
     status)    do_status ;;
     ai)        resolve_ai_mode; do_ai ;;
+    aadon)     do_aad_on ;;
+    aadoff)    do_aad_off ;;
   esac
 }
 
