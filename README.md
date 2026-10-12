@@ -5,12 +5,17 @@
 **One script. A firewall, AppArmor and safe kernel hardening, with full undo.**
 
 ![Version](https://img.shields.io/badge/version-3.0.3-blue)
+![Last updated](https://img.shields.io/badge/last%20updated-12%20Oct%202026-brightgreen)
 ![Shell](https://img.shields.io/badge/shell-bash-green)
 ![Init](https://img.shields.io/badge/requires-systemd-orange)
 
 `Arch Linux` · `Omarchy` · `EndeavourOS` · `Manjaro` · `Garuda Linux`
 
 </div>
+
+> 📅 **Last updated: 12 October 2026** (v3.0.3)
+>
+> Arch and Arch-based distros change fast: boot loaders, packages and defaults move over time. If this date is more than about 6 months old, check the [commits](../../commits) and [issues](../../issues) before running, and test on a VM or snapshot first.
 
 ---
 
